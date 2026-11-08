@@ -1,35 +1,33 @@
-// Sits between an agent and one MCP server (stdio). Passes everything through,
+// Sits between an agent and one MCP server. Passes everything through,
 // and journals, snapshots or holds each write action on the way.
-import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { get, newId, record } from "./journal.js";
+import { entries, get, logCall, newId, record } from "./journal.js";
 import { handlerFor } from "./handlers/index.js";
+import type { Upstream } from "./upstream.js";
 
-export function startProxy(server: string, command: string, args: string[]): void {
+export function startProxy(server: string, upstream: Upstream): void {
   const run = process.env.YARD_RUN ?? newId("run");
   let step = 0;
   let activeHolds = 0;
   let clientClosed = false;
 
-  const child = spawn(command, args, { stdio: ["pipe", "pipe", "inherit"], env: process.env });
   const pending = new Map<string | number, { entryId: string; swallow?: boolean }>();
-
   const toClient = (msg: unknown) => process.stdout.write(JSON.stringify(msg) + "\n");
-  const toServer = (msg: unknown) => child.stdin.write(JSON.stringify(msg) + "\n");
-  const maybeExit = () => { if (clientClosed && activeHolds === 0) child.stdin.end(); };
+  const maybeExit = () => { if (clientClosed && activeHolds === 0) upstream.close(); };
 
   process.stderr.write(`[yard] watching ${server} · run ${run}\n`);
 
   createInterface({ input: process.stdin }).on("line", async (line) => {
     let msg: any;
-    try { msg = JSON.parse(line); } catch { child.stdin.write(line + "\n"); return; }
+    try { msg = JSON.parse(line); } catch { return; }
 
-    if (msg.method !== "tools/call") return toServer(msg);
+    if (msg.method !== "tools/call") return upstream.send(msg);
 
     const tool: string = msg.params?.name;
     const toolArgs = msg.params?.arguments ?? {};
+    logCall(run, server, tool);
     const handler = handlerFor(server, tool, toolArgs);
-    if (!handler) return toServer(msg);
+    if (!handler) return upstream.send(msg);
 
     const entryId = newId("act");
     const base = { id: entryId, run, step: ++step, server, tool, args: toolArgs };
@@ -49,7 +47,7 @@ export function startProxy(server: string, command: string, args: string[]): voi
         const fwdId = `yard_${entryId}`;
         pending.set(fwdId, { entryId, swallow: true });
         record({ id: entryId, status: "released", reversible: false });
-        toServer({ ...msg, id: fwdId });
+        upstream.send({ ...msg, id: fwdId });
         maybeExit();
       }, holdMs);
       return;
@@ -68,23 +66,33 @@ export function startProxy(server: string, command: string, args: string[]): voi
       note: handler.irreversible,
     });
     pending.set(msg.id, { entryId });
-    toServer(msg);
+    upstream.send(msg);
   });
 
   process.stdin.on("end", () => { clientClosed = true; maybeExit(); });
 
-  createInterface({ input: child.stdout }).on("line", (line) => {
-    let msg: any;
-    try { msg = JSON.parse(line); } catch { process.stdout.write(line + "\n"); return; }
-    const p = msg.id !== undefined ? pending.get(msg.id) : undefined;
+  upstream.onMessage((msg) => {
+    const p = msg?.id !== undefined ? pending.get(msg.id) : undefined;
     if (p) {
       pending.delete(msg.id);
       if (msg.error) record({ id: p.entryId, status: "failed", note: msg.error.message });
-      else if (!p.swallow) record({ id: p.entryId, status: "done", result: msg.result });
+      else if (msg.result?.isError) record({ id: p.entryId, status: "failed", result: msg.result, note: "tool returned an error" });
+      else if (p.swallow) record({ id: p.entryId, result: msg.result });
+      else record({ id: p.entryId, status: "done", result: msg.result });
       if (p.swallow) return;
     }
     toClient(msg);
   });
 
-  child.on("exit", (code) => process.exit(code ?? 0));
+  // If the session ends while actions are held, they never run. Say so in the journal.
+  const dropHolds = () => {
+    for (const e of entries()) {
+      if (e.run === run && e.status === "held") record({ id: e.id, status: "dropped", note: "session ended before release; never ran" });
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", dropHolds);
+  process.on("SIGINT", dropHolds);
+
+  upstream.onClose((code) => process.exit(code ?? 0));
 }

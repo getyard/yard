@@ -8,44 +8,70 @@ Agents send email, change Stripe subscriptions and write to databases, and none 
 npm i -g @getyard/cli
 ```
 
-## Wrap an MCP server
+## Wrap a hosted MCP server (Stripe)
 
-Change one line in your agent's MCP config. The agent doesn't know yard is there.
+yard connects to the hosted server itself and passes your key along. In Claude Code:
 
-```json
-{
-  "mcpServers": {
-    "stripe": {
-      "command": "yard",
-      "args": ["proxy", "--name", "stripe", "--", "npx", "-y", "@stripe/mcp", "--tools=all"],
-      "env": { "STRIPE_SECRET_KEY": "sk_..." }
-    }
-  }
-}
+```bash
+claude mcp add stripe -e STRIPE_SECRET_KEY=sk_test_... -- yard proxy --name stripe --url https://mcp.stripe.com
+```
+
+Any other hosted server works the same way:
+
+```bash
+yard proxy --name myserver --url https://example.com/mcp --bearer-env MY_TOKEN
+yard proxy --name myserver --url https://example.com/mcp --header "X-Api-Key: abc"
+```
+
+## Wrap a local MCP server
+
+```bash
+claude mcp add myserver -- yard proxy --name myserver -- npx -y some-mcp-server
 ```
 
 ## Undo a run
 
+`yard undo` calls Stripe directly, so the key needs to be in your shell too:
+
 ```bash
+export STRIPE_SECRET_KEY=sk_test_...
 yard runs                     # every agent session
 yard show run_8f2             # what it did, step by step
 yard undo run_8f2 --from 3    # preview what will be reversed
 yard undo run_8f2 --from 3 --yes
+yard log                      # every tool call yard saw, reads included
 ```
 
-## What gets reversed
+## What gets reversed on Stripe
+
+Stripe's MCP does writes through one generic tool, `stripe_api_write`. yard works from what it can see rather than from operation names:
+
+| What the agent did | How yard reverses it |
+|---|---|
+| Created a customer, coupon, invoice item, webhook endpoint or test clock | Deleted |
+| Created a product, price, payment link, promotion code or portal configuration | Archived / deactivated |
+| Created an invoice | Draft deleted, open invoice voided |
+| Created a checkout session | Expired |
+| Created a subscription | Cancelled (a first payment it already collected is not refunded) |
+| Updated any object | Snapshotted before the write; undo puts back exactly the fields the agent changed |
+| Deleted, cancelled, voided, finalized, paid or sent something | **Held for 2 minutes**; undo means it never happens |
+| Refunds, payouts, transfers, Treasury money moves | Recorded; Stripe already asks a human to confirm these in the Dashboard |
+
+## Other servers
 
 | Server | Action | How yard handles it |
 |---|---|---|
-| Stripe | create customer / product / price / payment link | Deleted or deactivated on undo |
-| Stripe | create invoice | Draft deleted, finalized voided |
-| Stripe | update subscription | Snapshot before, restored on undo |
-| Stripe | refund, cancel subscription | Held 2 min; undo = never happens |
 | Email | send / reply / forward | Held 60s; undo = never sent |
-| Postgres | writes | Journaled (row-level undo is next) |
-| Anything else | writes | Journaled and flagged |
+| Postgres | writes | Recorded (row-level undo is next) |
+| Anything else | anything that isn't a read | Recorded and flagged |
 
 Reads pass straight through untouched.
+
+## Good to know
+
+- **Holds only release while the agent session is open.** If the session ends first, the held action never runs and the journal marks it `dropped`.
+- **Stripe keys:** Stripe MCP stops accepting full-access secret keys and untagged restricted keys in December 2026. Use an agent API key (Agent badge in the Dashboard) or OAuth before then.
+- **The journal stays on your machine** in `~/.yard`, and includes snapshots of the objects the agent changed.
 
 ## Settings
 
@@ -55,11 +81,12 @@ Reads pass straight through untouched.
 | `YARD_RUN` | auto | Group several servers under one run id |
 | `YARD_EMAIL_HOLD_MS` | `60000` | Email hold window |
 | `YARD_HOLD_MS` | per action | Override every hold window |
+| `STRIPE_SECRET_KEY` / `STRIPE_AGENT_KEY` | | Key yard uses for Stripe snapshots and undo |
 
 ## Develop
 
 ```bash
 npm install
 npm run build
-./test/e2e.sh
+npm test
 ```

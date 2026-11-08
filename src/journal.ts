@@ -4,7 +4,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export type Status = "pending" | "held" | "done" | "failed" | "undone" | "undo_failed" | "released";
+export type Status = "pending" | "held" | "done" | "failed" | "undone" | "undo_failed" | "released" | "dropped";
 
 export interface Entry {
   id: string;          // unique action id
@@ -54,6 +54,14 @@ export function runs(): { run: string; actions: number; first: string; last: str
     last: es[es.length - 1].ts,
   }));
 }
+
+// Every tool call yard sees, reads included, so "yard log" can show exactly what passed through.
+export function logCall(run: string, server: string, tool: string): void {
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  appendFileSync(join(dir, "calls.log"), `${new Date().toISOString()}  ${run}  ${server}.${tool}\n`);
+}
+
+export const callLogPath = join(dir, "calls.log");
 
 export const newId = (prefix: string) =>
   `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
