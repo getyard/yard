@@ -46,6 +46,22 @@ const BY_TYPE: Record<string, string> = {
   "test_helpers.test_clock": "test_helpers/test_clocks", "tax.registration": "tax/registrations",
 };
 const collectionFor = (id: string) => BY_PREFIX.find(([p]) => id.startsWith(p))?.[1];
+// Object type from an id prefix, for responses that don't say what they returned.
+export const typeFromId = (id: string) => {
+  const coll = collectionFor(id);
+  return coll ? Object.entries(BY_TYPE).find(([, c]) => c === coll)?.[0] : undefined;
+};
+
+// Stripe may pass parameters flat ({ customer, email }) or grouped ({ path: {...}, body: {...} }).
+export function normalizeParams(params: any): Record<string, any> {
+  if (!params || typeof params !== "object") return {};
+  const groups = ["path", "query", "body"].filter((g) => params[g] && typeof params[g] === "object" && !Array.isArray(params[g]));
+  if (!groups.length) return params;
+  const flat: Record<string, any> = {};
+  for (const [k, v] of Object.entries(params)) if (!groups.includes(k)) flat[k] = v;
+  for (const g of groups) Object.assign(flat, params[g]);
+  return flat;
+}
 
 // How to reverse a create, by object type.
 const REVERSE_CREATE: Record<string, (id: string, acct?: string) => Promise<unknown>> = {
@@ -79,9 +95,23 @@ const STRIPE_CONFIRMS = /(refund|payout|transfer)/i;
 
 const looksLikeId = (v: unknown): v is string => typeof v === "string" && /^[a-z]{2,8}_[A-Za-z0-9]{6,}/.test(v);
 
-// Every Stripe object id mentioned at the top level of the parameters.
-function referencedIds(params: any): string[] {
-  return Object.values(params ?? {}).filter(looksLikeId).filter((id) => collectionFor(id));
+// Every Stripe object id mentioned anywhere in the parameters.
+function referencedIds(params: any, depth = 0, found = new Set<string>()): string[] {
+  if (depth > 4 || !params || typeof params !== "object") return [...found];
+  for (const v of Object.values(params)) {
+    if (looksLikeId(v) && collectionFor(v)) found.add(v);
+    else if (v && typeof v === "object") referencedIds(v, depth + 1, found);
+  }
+  return [...found];
+}
+
+// Objects created more than this long before the action can't be "its" creation.
+const CREATED_TOLERANCE_S = 600;
+
+// True if the id appears anywhere in the parameters (a create can't name its own new id).
+function mentions(params: any, id: string, depth = 0): boolean {
+  if (depth > 10 || !params || typeof params !== "object") return false;
+  return Object.values(params).some((v) => v === id || (v && typeof v === "object" && mentions(v, id, depth + 1)));
 }
 
 function flatten(value: unknown, key: string, out: Record<string, string>) {
@@ -136,7 +166,7 @@ async function restoreBody(target: string, before: any, params: any, acct?: stri
 
 export function stripeApiHandler(args: any): Handler {
   const op = String(args?.stripe_api_operation_id ?? args?.operation_id ?? args?.operation ?? "");
-  const params = args?.parameters ?? {};
+  const params = normalizeParams(args?.parameters);
   const acct: string | undefined = args?.stripe_context;
 
   if (STRIPE_CONFIRMS.test(op)) {
@@ -169,8 +199,30 @@ export function stripeApiHandler(args: any): Handler {
         return;
       }
 
-      const reverse = REVERSE_CREATE[r.object];
-      if (!reverse) throw new Error(`no undo for creating a ${r.object ?? "this kind of object"} yet`);
+      // The agent named this object in its request, so this was an update, not a create.
+      // Without a snapshot from before the change, there's nothing safe to restore.
+      if (collectionFor(id) && mentions(args?.parameters, id)) {
+        throw new Error(`no snapshot of ${id} from before this change, so yard can't restore it`);
+      }
+
+      const type: string | undefined = r.object ?? typeFromId(id);
+      const reverse = type ? REVERSE_CREATE[type] : undefined;
+      if (!reverse) throw new Error(`no undo for creating a ${type ?? "this kind of object"} yet`);
+
+      // Safety: only reverse a create if the object really was born in this action.
+      // An object that existed before (an update yard couldn't snapshot) is never deleted.
+      const coll = collectionFor(id) ?? BY_TYPE[type!];
+      let current: any;
+      try { current = await stripeRest("GET", `${coll}/${id}`, undefined, acct); }
+      catch (err) {
+        if (/No such|resource_missing|404/.test((err as Error).message)) return; // already gone
+        throw err;
+      }
+      if (current?.deleted) return; // already gone
+      const actedAt = Date.parse(entry.firstTs ?? entry.ts) / 1000;
+      if (typeof current?.created === "number" && current.created < actedAt - CREATED_TOLERANCE_S) {
+        throw new Error(`${id} existed before this action, so yard won't delete it`);
+      }
       await reverse(id, acct);
     },
   };

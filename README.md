@@ -36,11 +36,19 @@ claude mcp add myserver -- yard proxy --name myserver -- npx -y some-mcp-server
 ```bash
 export STRIPE_SECRET_KEY=sk_test_...
 yard runs                     # every agent session
-yard show run_8f2             # what it did, step by step
-yard undo run_8f2 --from 3    # preview what will be reversed
-yard undo run_8f2 --from 3 --yes
+yard show last                # what the latest run did, step by step
+yard undo last                # preview what will be reversed
+yard undo last --yes          # reverse it
+yard undo run_8f2 --from 3 --yes   # reverse one run from step 3 onward
+yard inspect last 2           # exactly what yard recorded for step 2
 yard log                      # every tool call yard saw, reads included
 ```
+
+`last` works anywhere a run id does.
+
+## Safety
+
+yard only deletes or archives an object it can prove the agent created in that step: the object must not appear in the step's own request, and Stripe must report it was created at the time of the action. Updates are only reversed from a snapshot taken before the write. When yard can't prove either, it refuses and says why, rather than guessing.
 
 ## What gets reversed on Stripe
 

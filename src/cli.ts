@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync } from "node:fs";
-import { callLogPath, entries, record, runs } from "./journal.js";
+import { callLogPath, entries, record, runs, type Entry } from "./journal.js";
 import { handlerFor } from "./handlers/index.js";
+import { resultJson } from "./handlers/types.js";
 import { startProxy } from "./proxy.js";
 import { commandUpstream, httpUpstream } from "./upstream.js";
 
@@ -17,6 +18,25 @@ const flags = (name: string) => opts.flatMap((v, i) => (v === `--${name}` && opt
 const icons: Record<string, string> = {
   done: "✓", pending: "…", held: "⏸", released: "→", failed: "✗", undone: "↺", undo_failed: "!", dropped: "⊘",
 };
+
+// "last" means the most recent run, so nobody has to copy run ids.
+const resolveRun = (run?: string) => (run === "last" || run === undefined ? runs().at(-1)?.run : run);
+
+// What a write actually did, e.g. "PostCustomers → cus_123".
+function describe(e: Entry): string {
+  const a: any = e.args ?? {};
+  const op = a.stripe_api_operation_id ?? a.operation_id ?? a.operation;
+  const id = e.result ? resultJson(e)?.id : undefined;
+  return [op, id ? `→ ${id}` : ""].filter(Boolean).join(" ");
+}
+
+function label(e: Entry): string {
+  if (e.status === "held") return "can cancel";
+  if (e.status === "dropped") return "never ran";
+  if (e.status === "failed") return "nothing changed";
+  if (e.status === "undone") return "reversed";
+  return e.reversible ? "reversible" : "irreversible";
+}
 
 async function main() {
   switch (cmd) {
@@ -58,19 +78,29 @@ async function main() {
     }
 
     case "show": {
-      const run = rest[0];
+      const run = resolveRun(rest[0]);
+      if (!run) return console.log("No agent runs recorded yet.");
+      console.log(run);
       for (const e of entries().filter((e) => e.run === run).sort((a, b) => a.step - b.step)) {
-        const rev = e.status === "held" ? "can cancel"
-          : e.status === "dropped" ? "never ran"
-          : e.reversible ? "reversible" : "irreversible";
-        console.log(`${String(e.step).padStart(3)}  ${icons[e.status] ?? "?"} ${e.server}.${e.tool}  [${e.status}, ${rev}]${e.note ? `  ${e.note}` : ""}`);
+        const what = describe(e);
+        console.log(`${String(e.step).padStart(3)}  ${icons[e.status] ?? "?"} ${e.server}.${e.tool}${what ? `  ${what}` : ""}  [${e.status}, ${label(e)}]${e.note ? `  ${e.note}` : ""}`);
       }
       return;
     }
 
+    case "inspect": {
+      // Exactly what yard recorded for one step: the arguments and the server's response.
+      const run = resolveRun(rest[0]);
+      const step = Number(rest[1]);
+      const e = entries().find((x) => x.run === run && x.step === step);
+      if (!e) return console.log(`No step ${rest[1]} in ${run}. usage: yard inspect <run|last> <step>`);
+      console.log(JSON.stringify({ step: e.step, tool: `${e.server}.${e.tool}`, status: e.status, note: e.note, args: e.args, result: e.result, snapshotted: Object.keys((e.snapshot as object) ?? {}) }, null, 2));
+      return;
+    }
+
     case "undo": {
-      const run = rest[0];
-      if (!run) throw new Error("usage: yard undo <run> [--from <step>] [--yes]");
+      const run = resolveRun(rest[0]);
+      if (!rest[0] || !run) throw new Error("usage: yard undo <run|last> [--from <step>] [--yes]");
       const from = Number(flag("from") ?? 1);
       const execute = rest.includes("--yes");
       const targets = entries()
@@ -78,10 +108,19 @@ async function main() {
         .sort((a, b) => b.step - a.step); // newest first
 
       if (!targets.length) return console.log(`Nothing to undo in ${run} from step ${from}.`);
+
+      // Catch a missing or placeholder Stripe key before touching anything.
+      if (execute && targets.some((e) => /stripe/i.test(e.server) && ["done", "undo_failed"].includes(e.status))) {
+        const key = process.env.STRIPE_SECRET_KEY ?? process.env.STRIPE_API_KEY ?? process.env.STRIPE_AGENT_KEY;
+        if (!key) throw new Error("undo needs your Stripe key in this terminal: export STRIPE_SECRET_KEY=sk_test_... (your real key)");
+        if (/YOUR_KEY|NEW_KEY|\.\.\.|[<>]/.test(key) || key.length < 20) {
+          throw new Error("STRIPE_SECRET_KEY is still placeholder text. Export your real sk_test_ key from dashboard.stripe.com/test/apikeys");
+        }
+      }
       console.log(execute ? `Undoing ${run} from step ${from}:` : `Preview, nothing changed yet (add --yes to run):`);
 
       for (const e of targets) {
-        const label = `step ${e.step} ${e.server}.${e.tool}`;
+        const label = `step ${e.step} ${e.server}.${e.tool}${describe(e) ? ` ${describe(e)}` : ""}`;
         if (["undone", "failed", "dropped"].includes(e.status)) { console.log(`  skip    ${label} (${e.status})`); continue; }
         if (e.status === "held") {
           if (execute) record({ id: e.id, status: "undone", note: "cancelled during hold" });
@@ -89,7 +128,7 @@ async function main() {
           continue;
         }
         const handler = handlerFor(e.server, e.tool, e.args);
-        if (e.status !== "done" || !handler?.undo || !e.reversible) {
+        if (!["done", "undo_failed"].includes(e.status) || !handler?.undo || !e.reversible) {
           console.log(`  manual  ${label}: can't be reversed automatically${e.note ? ` (${e.note})` : ""}`);
           continue;
         }
@@ -112,8 +151,9 @@ async function main() {
   yard proxy --name <server> --url <https://...>     wrap a hosted MCP server
   yard proxy --name <server> -- <cmd...>             wrap a local MCP server
   yard runs                                          list agent runs
-  yard show <run>                                    list actions in a run
-  yard undo <run> [--from N] [--yes]                 preview, then reverse a run
+  yard show <run|last>                               list actions in a run
+  yard undo <run|last> [--from N] [--yes]            preview, then reverse a run
+  yard inspect <run|last> <step>                     what yard recorded for one step
   yard log [n]                                       last n tool calls yard saw`);
   }
 }

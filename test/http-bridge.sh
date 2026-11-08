@@ -30,7 +30,7 @@ node dist/cli.js log
 echo "--- yard show"
 SHOW=$(node dist/cli.js show run_http)
 echo "$SHOW"
-echo "$SHOW" | grep -q "stripe.stripe_api_write  \[done, reversible\]" || { echo "FAIL: write not journaled as reversible"; exit 1; }
+echo "$SHOW" | grep -q "stripe.stripe_api_write  PostCustomers → cus_FAKE123456  \[done, reversible\]" || { echo "FAIL: write not journaled as reversible"; exit 1; }
 echo "$SHOW" | grep -q "stripe_api_read" && { echo "FAIL: read should not be journaled"; exit 1; }
 echo "--- undo preview"
 node dist/cli.js undo run_http

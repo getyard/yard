@@ -18,7 +18,8 @@ export interface Entry {
   status: Status;
   reversible: boolean;
   note?: string;
-  ts: string;
+  ts: string;          // time of the latest event for this entry
+  firstTs?: string;    // time the action was first seen (before it ran)
 }
 
 const dir = process.env.YARD_HOME ?? join(homedir(), ".yard");
@@ -35,7 +36,8 @@ export function entries(): Entry[] {
   for (const line of readFileSync(file, "utf8").split("\n")) {
     if (!line.trim()) continue;
     const ev = JSON.parse(line);
-    byId.set(ev.id, { ...(byId.get(ev.id) ?? {}), ...ev });
+    const prev = byId.get(ev.id);
+    byId.set(ev.id, { ...(prev ?? {}), ...ev, firstTs: prev?.firstTs ?? ev.ts });
   }
   return [...byId.values()];
 }
